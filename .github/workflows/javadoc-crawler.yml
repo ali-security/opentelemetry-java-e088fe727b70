@@ -1,8 +1,6 @@
 name: Javadoc.io site crawler (daily)
 
 on:
-  schedule:
-    - cron: "30 1 * * *" # daily at 1:30 UTC
   workflow_dispatch:
 
 permissions:

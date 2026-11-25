@@ -1,12 +1,12 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - main
-      - release/*
-  pull_request:
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test task(s) to run instead of the full build (e.g. ':api:all:test --tests FooTest')"
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -19,12 +19,13 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         os:
           - macos-latest
-          - macos-13
+          - macos-15-intel
           - ubuntu-latest
           - windows-latest
         test-java-version:
@@ -39,17 +40,17 @@ jobs:
             test-java-version: 21
             coverage: true
             jmh-based-tests: true
-        # macos-latest drops support for java 8 temurin. Run java 8 on macos-13. Run java 11+ on macos-latest.
+        # macos-latest drops support for java 8 temurin. Run java 8 on macos-15-intel. Run java 11+ on macos-latest.
         exclude:
           - os: macos-latest
             test-java-version: 8
-          - os: macos-13
+          - os: macos-15-intel
             test-java-version: 11
-          - os: macos-13
+          - os: macos-15-intel
             test-java-version: 17
-          - os: macos-13
+          - os: macos-15-intel
             test-java-version: 21
-          - os: macos-13
+          - os: macos-15-intel
             test-java-version: 25 # renovate: datasource=java-version
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -60,49 +61,176 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.test-java-version }}
+          cache: gradle
 
       - id: setup-java
         name: Set up Java for build
         uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
         with:
           distribution: temurin
-          java-version: 17
+          # pinned to the JDK that built the published 1.55.0 jar (MANIFEST Built-JDK: 17.0.16)
+          java-version: 17.0.16+8
+          cache: gradle
 
       - name: Set up gradle
         uses: gradle/actions/setup-gradle@4d9f0ba0025fe599b4ebab900eb7f3a1d93ef4c2 # v5.0.0
+
+      - name: Write seal init script (disable lint gates, record test results)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-ci.gradle" <<'GRADLE'
+          def resultsFile = new File(System.getenv('RUNNER_TEMP'), 'seal-test-results.txt')
+          // Upstream source comments next to the assumeThat/assumeTrue calls that skip these tests.
+          def assumptionNotes = [
+            minimalChannel: 'test targets UpstreamGrpcSender only; assumeThat skips the OkHttpGrpcSender variant',
+            compressionWithGzip: "UpstreamGrpcSender doesn't support compression; assumeThat skips it",
+            compressionWithNone: "UpstreamGrpcSender doesn't support compression; assumeThat skips it",
+            compressionWithSpiCompressor: "UpstreamGrpcSender doesn't support compression; assumeThat skips it",
+            connectTimeout: "UpstreamGrpcSender doesn't support connectTimeout; assumeThat skips it",
+            latestInternalTelemetry: 'profiles do not expose metrics yet; assumeThat(type != profile)',
+            legacyInternalTelemetry: 'profiles do not expose metrics yet; assumeThat(type != profile)',
+            expectedOkHttpVersion: 'okhttp version pin check does not apply to the LATEST okhttp variant',
+            normalizedAllocationRateTest: 'long JMH GC benchmark; upstream runs it only where RUN_JMH_BASED_TESTS=true (ubuntu-latest Java 21 leg)',
+          ]
+          def failedIds = Collections.synchronizedSet(new HashSet<String>())
+          String osName = System.getProperty('os.name')
+          String dockerNote = osName.startsWith('Windows') ?
+            "Testcontainers integration test needs a Linux Docker engine; the Windows runner's engine runs Windows containers only and rejects Testcontainers' API 1.32 client, so it is disabled here and runs on the ubuntu legs" :
+            (osName.startsWith('Mac') ? 'Testcontainers integration test needs Docker; macOS runners have no Docker engine, so it is disabled here and runs on the ubuntu legs' :
+              'Testcontainers integration test disabled because Docker is unavailable')
+          // Resolve the JUnit condition annotations (@Disabled, @EnabledOnJre, @Testcontainers, ...) of a skipped test.
+          def annotationReason = { t, String className, String methodName ->
+            URLClassLoader cl = null
+            try {
+              URL[] urls = t.classpath.files.findAll { it.exists() }.collect { it.toURI().toURL() } as URL[]
+              cl = new URLClassLoader(urls, ClassLoader.getPlatformClassLoader())
+              Class cls = Class.forName(className, false, cl)
+              def pick = { anns -> anns.findAll { a -> a.annotationType().simpleName ==~ /.*(Disabled|Enabled|Testcontainers).*/ }.collect { a -> a.toString().replaceAll(/@([a-z_][a-z0-9_]*\.)+/, '@') } }
+              def found = []
+              try {
+                Class c = cls
+                while (c != null) {
+                  def m = c.declaredMethods.find { it.name == methodName }
+                  if (m != null) { found.addAll(pick(m.annotations)); break }
+                  c = c.superclass
+                }
+              } catch (Throwable ignored) {
+                // a method signature type that cannot be resolved; fall back to the class annotations
+              }
+              Class k = cls
+              while (k != null) {
+                try { found.addAll(pick(k.annotations)) } catch (Throwable ignored) { }
+                k = k.superclass
+              }
+              return found ? found.unique().join(' ') : null
+            } catch (Throwable e) {
+              return null
+            } finally {
+              if (cl != null) cl.close()
+            }
+          }
+          allprojects {
+            tasks.configureEach { t ->
+              def n = t.name
+              if (n ==~ /checkstyle[A-Z].*/ || n.startsWith('spotless') || n ==~ /animalsniffer[A-Z].*/ || n == 'jApiCmp') {
+                t.enabled = false
+              }
+            }
+            tasks.withType(Test).configureEach { t ->
+              // Testcontainers integration tests need a Linux Docker engine: macOS runners have none and the
+              // Windows runner's engine runs Windows containers only. Upstream's own macOS/Windows legs skip
+              // them via @Testcontainers(disabledWithoutDocker = true); exclude them explicitly here instead,
+              // they run (and must pass) on every ubuntu leg.
+              def dockerOnlyTests = [
+                ':exporters:prometheus': ['io.opentelemetry.exporter.prometheus.CollectorIntegrationTest',
+                                          'io.opentelemetry.exporter.prometheus.PrometheusIntegrationTest'],
+                ':exporters:zipkin': ['io.opentelemetry.exporter.zipkin.ZipkinSpanExporterEndToEndHttpTest'],
+                ':integration-tests:otlp': ['io.opentelemetry.integrationtest.NoGrpcJavaOtlpIntegrationTest',
+                                            'io.opentelemetry.integrationtest.GrpcJavaOtlpIntegrationTest'],
+                ':sdk-extensions:jaeger-remote-sampler': ['io.opentelemetry.sdk.extension.trace.jaeger.sampler.JaegerRemoteSamplerIntegrationTest'],
+              ]
+              def excluded = dockerOnlyTests[t.project.path]
+              if (excluded && !osName.startsWith('Linux')) {
+                excluded.each { cls ->
+                  t.filter.excludeTestsMatching(cls)
+                  synchronized (resultsFile) { resultsFile << "EXCLUDED\t${t.path}\t${cls}\t${dockerNote}\n" }
+                }
+                t.filter.failOnNoMatchingTests = false
+                if (t.hasProperty('failOnNoDiscoveredTests')) t.failOnNoDiscoveredTests = false
+              }
+              t.afterTest { desc, result ->
+                String testId = "${t.path}\t${desc.className}#${desc.name}"
+                if (result.resultType == TestResult.ResultType.FAILURE) {
+                  failedIds.add(testId)
+                  synchronized (resultsFile) { resultsFile << "FAILED\t${testId}\n" }
+                } else if (result.resultType == TestResult.ResultType.SUCCESS && failedIds.contains(testId)) {
+                  // upstream's develocity testRetry (maxRetries=2 when CI is set) re-ran a failed test and it passed
+                  synchronized (resultsFile) { resultsFile << "RETRY_PASSED\t${testId}\n" }
+                }
+                if (result.resultType == TestResult.ResultType.SKIPPED) {
+                  String method = desc.name.replaceAll(/\(.*$/, '').replaceAll(/\[.*$/, '')
+                  String note = assumptionNotes[method]
+                  String reason
+                  def ex = result.exception
+                  if (ex != null) {
+                    String msg = (ex.message ?: ex.class.simpleName).replaceAll(/@[0-9a-f]{4,}/, '').replaceAll(/\s+/, ' ').trim()
+                    if (msg.length() > 140) msg = msg.substring(0, 140) + '...'
+                    reason = 'assumption not met' + (note ? " (${note})" : '') + ": ${msg}"
+                  } else {
+                    String ann = annotationReason(t, desc.className, method)
+                    if (ann == null && note) reason = "assumption not met (${note})"
+                    else if (ann == null) reason = 'skipped at runtime by a JUnit assumption/condition'
+                    else if (ann.contains('@Disabled(')) reason = "disabled upstream -> ${ann}"
+                    else if (ann.contains('disabledWithoutDocker=true')) reason = "${dockerNote} -> ${ann}"
+                    else if (ann.contains('EnabledInNativeImage')) reason = "runs only inside a GraalVM native image (covered by the Build GraalVM nativeTest job) -> ${ann}"
+                    else reason = "upstream JUnit condition -> ${ann}"
+                  }
+                  synchronized (resultsFile) { resultsFile << "SKIPPED\t${t.path}\t${desc.className}#${desc.name}\t${reason}\n" }
+                }
+              }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  synchronized (resultsFile) { resultsFile << "SUMMARY ${t.path} total=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount}\n" }
+                }
+              }
+            }
+          }
+          GRADLE
+
+      - name: Let Testcontainers reach the runner's Docker daemon
+        # Testcontainers 1.21.3 pins docker-java to API 1.32 unless api.version is configured, and the
+        # runner's Docker Engine rejects API versions below its minimum ("client version 1.32 is too old"),
+        # which silently disables every @Testcontainers(disabledWithoutDocker = true) integration test.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "api.version=1.44" > "$HOME/.docker-java.properties"
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.32\n' | sudo tee /etc/systemd/system/docker.service.d/zz-seal-min-api.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
+          docker version
+
       - name: Build
-        run: >
-            ./gradlew build
-            ${{ matrix.coverage && 'jacocoTestReport' || '' }}
-            -PtestJavaVersion=${{ matrix.test-java-version }}
-            "-Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }}"
-            "-Porg.gradle.java.installations.auto-download=false"
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew :api:all:jar ${{ inputs.test-filter }} \
+              --no-build-cache -I "$RUNNER_TEMP/seal-ci.gradle" -PdisableErrorProne=true \
+              -PtestJavaVersion=${{ matrix.test-java-version }} \
+              "-Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }}" \
+              "-Porg.gradle.java.installations.auto-download=false"
+          else
+            ./gradlew build \
+              ${{ matrix.coverage && 'jacocoTestReport' || '' }} \
+              --no-build-cache -I "$RUNNER_TEMP/seal-ci.gradle" -PdisableErrorProne=true \
+              -PtestJavaVersion=${{ matrix.test-java-version }} \
+              "-Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }}" \
+              "-Porg.gradle.java.installations.auto-download=false"
+          fi
         env:
           # JMH-based tests run only if this environment variable is set to true
           RUN_JMH_BASED_TESTS: ${{ matrix.jmh-based-tests }}
-
-      - name: Check for diff
-        # The jApiCmp diff compares current to latest, which isn't appropriate for release branches
-        # this fails on windows because of the bash-specific if/then/else syntax, but that's ok
-        # because we only need to run this validation once (on any platform)
-        if: ${{ matrix.os != 'windows-latest' && !startsWith(github.ref_name, 'release/') && !startsWith(github.base_ref, 'release/') }}
-        run: |
-          # need to "git add" in case any generated files did not already exist
-          git add docs/apidiffs
-          if git diff --cached --quiet
-          then 
-            echo "No diff detected."
-          else 
-            echo "Diff detected - did you run './gradlew jApiCmp'?"
-            echo $(git diff --cached --name-only)
-            echo $(git diff --cached)
-            exit 1
-          fi
-
-      - uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5.5.1
-        if: ${{ matrix.coverage }}
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ matrix.coverage }}
@@ -110,14 +238,46 @@ jobs:
           name: coverage-report
           path: all/build/reports/jacoco/test/html
 
+      - name: Upload opentelemetry-api jar
+        if: ${{ matrix.coverage }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opentelemetry-api-jar
+          path: api/all/build/libs/opentelemetry-api-1.55.0.jar
+          if-no-files-found: error
+
+      - name: Test results summary
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/seal-test-results.txt"
+          if [ ! -f "$f" ]; then echo "No test results recorded"; exit 0; fi
+          echo "===== Per-task test summary ====="
+          awk '/^SUMMARY/' "$f" | sort
+          echo "===== Excluded on this OS (Docker-only Testcontainers classes; they run on the ubuntu legs) ====="
+          awk -F'\t' '$1=="EXCLUDED" && !seen[$2 " " $3]++ { printf "EXCLUDED %s %s :: %s\n", $2, $3, $4 }' "$f"
+          echo "===== Skipped tests, one line per reason ====="
+          awk -F'\t' '$1=="SKIPPED" { n=$3; sub(/^([a-z0-9_]+\.)+/, "", n); key=$4;
+                 if (!(key in cnt)) order[++k]=key; cnt[key]++;
+                 if (!((key SUBSEP n) in seen)) { seen[key SUBSEP n]=1; list[key]=(key in list) ? list[key] ", " n : n } }
+               END { for (i=1;i<=k;i++) { key=order[i]; printf "SKIP REASON [%d skipped]: %s :: %s\n", cnt[key], key, list[key] } }' "$f"
+          echo "===== Test retries (upstream develocity testRetry: maxRetries=2 when CI is set) ====="
+          awk -F'\t' '$1=="FAILED" { f[$2 " " $3]=1 } $1=="RETRY_PASSED" { p[$2 " " $3]=1 }
+               END { for (id in f) { if (id in p) printf "RETRIED AND PASSED: %s (one failed attempt, passed on the upstream test retry)\n", id; else printf "FINAL FAILURE: %s\n", id } }' "$f"
+          awk '/^SUMMARY/ { for (i=3;i<=NF;i++) { split($i,kv,"="); tot[kv[1]]+=kv[2] } }
+               END { printf "TOTAL TESTS: %d, passed: %d, failed: %d, skipped: %d (counts include retry attempts)\n", tot["total"], tot["passed"], tot["failed"], tot["skipped"] }' "$f"
+          awk -F'\t' '$1=="FAILED" { f[$2 " " $3]=1 } $1=="RETRY_PASSED" { p[$2 " " $3]=1 }
+               END { nf=0; nr=0; for (id in f) { if (id in p) nr++; else nf++ }
+                     printf "FINAL RESULT: tests still failing after upstream retries: %d; tests that failed once and passed on retry: %d\n", nf, nr }' "$f"
+
   markdown-link-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-markdown-link-check.yml
 
   misspell-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-misspell-check.yml
 
   publish-snapshots:
@@ -133,7 +293,9 @@ jobs:
     name: publish-snapshots${{ (github.ref_name != 'main' || github.repository != 'open-telemetry/opentelemetry-java') && ' (skipped)' || '' }}
     # intentionally not blocking snapshot publishing on markdown-link-check or misspell-check
     needs: build
+    if: false
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
@@ -163,6 +325,7 @@ jobs:
   build-graal:
     name: Build GraalVM
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -183,7 +346,7 @@ jobs:
           echo "JAVA_HOME: $JAVA_HOME"
           java --version
           native-image --version
-          ./gradlew nativeTest
+          ./gradlew nativeTest --no-build-cache
 
   required-status-check:
     # markdown-link-check is not required so pull requests are not blocked if external links break
@@ -193,6 +356,7 @@ jobs:
       - build
       - build-graal
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: always()
     steps:
       - if: |

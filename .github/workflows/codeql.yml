@@ -1,18 +1,7 @@
 name: CodeQL
 
 on:
-  pull_request:
-    branches:
-      - main
-      - release/*
-      - benchmarks
-  push:
-    branches:
-      - main
-      - release/*
-      - benchmarks
-  schedule:
-    - cron: "23 16 * * 2"  # weekly at 16:23 UTC on Tuesday
+  workflow_dispatch:
 
 permissions:
   contents: read
